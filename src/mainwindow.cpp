@@ -67,12 +67,14 @@ const QString DARK_OVERLAYS = QStringLiteral(
 );
 }
 
-MainWindow::MainWindow(AppItem *initialItem, QWidget *parent)
-    : QMainWindow(parent)
+MainWindow::MainWindow(AppItem *initialItem, MainWindow *parentWindow)
+    : QMainWindow(nullptr)
     , ui(new Ui::MainWindow)
     , delegate(nullptr)
     , currentItem(initialItem)
     , rootItem(nullptr)
+    , ownsRootItem(initialItem == nullptr)
+    , m_parentWindow(parentWindow)
     , contextMenu(nullptr)
     , editAction(nullptr)
     , deleteAction(nullptr)
@@ -122,18 +124,21 @@ MainWindow::MainWindow(AppItem *initialItem, QWidget *parent)
         styleFile.close();
     }
 
-    if (initialItem) {
-        MainWindow *parentWin = qobject_cast<MainWindow*>(parent);
-        if (parentWin) {
-            rootItem = parentWin->rootItem;
-            m_savedLanguage = parentWin->m_savedLanguage;
-            m_darkMode = parentWin->m_darkMode;
-            delegate->setDarkMode(m_darkMode);
-        }
-    } else {
+    if (initialItem && m_parentWindow) {
+        rootItem = m_parentWindow->rootItem;
+        m_savedLanguage = m_parentWindow->m_savedLanguage;
+        m_darkMode = m_parentWindow->m_darkMode;
+        delegate->setDarkMode(m_darkMode);
+        // If the tree is freed while this window is still alive, its currentItem
+        // becomes dangling. Clear the owner window so a stale pointer is never
+        // dereferenced on a late event.
+        connect(m_parentWindow, &QObject::destroyed, this, [this]() {
+            currentItem = nullptr;
+            rootItem = nullptr;
+        });
+    } else if (!initialItem) {
         loadConfig();
     }
-
     if (!this->currentItem) {
         this->currentItem = rootItem;
     }
@@ -161,7 +166,17 @@ MainWindow::~MainWindow()
         qApp->removeTranslator(currentTranslator);
     }
     delete ui;
-    delete rootItem;
+    ui = nullptr;
+    // Only the window that owns the tree (the root/main window) may delete it.
+    // Child windows merely share a pointer to it, so deleting it here would
+    // free the root a second time once the child windows are destroyed.
+    if (rootItem && ownsRootItem) {
+        delete rootItem;
+    }
+    // The tree is gone now, so this window's currentItem is dangling. Clear it
+    // so late event delivery (e.g. LanguageChange) cannot dereference it.
+    currentItem = nullptr;
+    rootItem = nullptr;
     if (contextMenu) {
         delete contextMenu;
     }
@@ -170,17 +185,19 @@ MainWindow::~MainWindow()
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     saveConfig();
-    MainWindow *parentMain = qobject_cast<MainWindow*>(parent());
-    if (parentMain) {
-        parentMain->refreshIconList();
-        parentMain->show();
+    if (m_parentWindow) {
+        m_parentWindow->refreshIconList();
+        m_parentWindow->show();
     }
     QMainWindow::closeEvent(event);
 }
 
 void MainWindow::changeEvent(QEvent *event)
 {
-    if (event->type() == QEvent::LanguageChange && currentItem) {
+    // ui and the header widgets are destroyed before this window finishes
+    // dying, but Qt can still deliver a LanguageChange afterwards. Guard
+    // against touching freed memory.
+    if (event->type() == QEvent::LanguageChange && ui && currentItem) {
         ui->retranslateUi(this);
         retranslateLanguageToggle();
         QString name = currentItem->getName().isEmpty() ? tr("Home") : currentItem->getName();
@@ -251,6 +268,8 @@ void MainWindow::retranslateLanguageToggle()
 
 void MainWindow::onLanguageChanged(int index)
 {
+    if (!languageCombo || !ui) return;
+
     QString locale = languageCombo->itemData(index).toString();
 
     QTranslator *translator = new QTranslator(this);
@@ -399,7 +418,7 @@ void MainWindow::setupHeaderBar()
 
     connect(m_backBtn, &QToolButton::clicked, this, &MainWindow::onBackClicked);
 
-    m_backBtn->setVisible(parent() != nullptr);
+    m_backBtn->setVisible(!ownsRootItem);
     QString title = currentItem ? currentItem->getName() : QString();
     if (title.isEmpty()) title = tr("Home");
     m_titleLabel->setText(title);
@@ -407,10 +426,9 @@ void MainWindow::setupHeaderBar()
 
 void MainWindow::onBackClicked()
 {
-    MainWindow *parentWin = qobject_cast<MainWindow*>(parent());
-    if (parentWin) {
-        parentWin->refreshIconList();
-        parentWin->show();
+    if (m_parentWindow) {
+        m_parentWindow->refreshIconList();
+        m_parentWindow->show();
     }
     close();
 }
@@ -600,7 +618,7 @@ void MainWindow::saveConfig()
 
 void MainWindow::refreshIconList()
 {
-    if (!currentItem) return;
+    if (!currentItem || !ui) return;
 
     ui->iconListWidget->clear();
 
@@ -662,8 +680,12 @@ void MainWindow::onIconListItemClicked(QListWidgetItem *item)
     else if (tag == TagAppItem) {
         auto *appItem = static_cast<AppItem*>(item->data(Qt::UserRole).value<QObject*>());
         if (currentItem->getSubApps().contains(appItem)) {
-            MainWindow *newWindow = new MainWindow(appItem, this);
+            // Navigation parent is tracked explicitly instead of via the
+            // QWidget parent: child windows use WA_DeleteOnClose, so a QWidget
+            // parent would delete them a second time when it is destroyed.
+            MainWindow *newWindow = new MainWindow(appItem, nullptr);
             newWindow->setAttribute(Qt::WA_DeleteOnClose);
+            newWindow->m_parentWindow = this;
             newWindow->show();
             this->hide();
         }

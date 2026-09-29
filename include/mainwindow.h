@@ -26,8 +26,8 @@ class MainWindow : public QMainWindow
     Q_OBJECT
 
 public:
-    explicit MainWindow(AppItem *initialItem = nullptr, QWidget *parent = nullptr);
-    ~MainWindow();
+    explicit MainWindow(AppItem *initialItem = nullptr, MainWindow *parentWindow = nullptr);
+    ~MainWindow() override;
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -61,6 +61,12 @@ private:
     IconListDelegate *delegate;
     AppItem *currentItem;
     AppItem *rootItem;
+    // True only for the window that loaded the tree; child windows share
+    // rootItem by pointer and must never free it.
+    bool ownsRootItem = false;
+    // Window to return to when the back button is pressed. Tracked explicitly
+    // rather than through parent() so child windows stay top-level QObjects.
+    MainWindow *m_parentWindow = nullptr;
     QTranslator *currentTranslator = nullptr;
 
     QMenu *contextMenu;
