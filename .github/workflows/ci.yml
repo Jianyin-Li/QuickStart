@@ -73,15 +73,85 @@ jobs:
           [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Process)
           gcc --version
 
+      # The windows runners already ship MinGW, CMake, Ninja and vcpkg in
+      # their image, so only reinstall what is genuinely missing. Everything
+      # expensive (Qt, yaml-cpp) is served from the caches below.
       - name: Install build tools
         run: |
           choco install ninja -y
           choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
-          choco install vcpkg -y
-          vcpkg install yaml-cpp:x64-mingw-dynamic
-          echo "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "CMAKE_PREFIX_PATH=$env:VCPKG_ROOT/installed/x64-mingw-dynamic" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not (Get-Command mingw32-make -ErrorAction SilentlyContinue)) {
+            choco install mingw --version 13.2.0 --params="/InstallDir:C:\mingw64 /Architecture:x86_64" -y
+          }
+
+      # Cache the vcpkg *installed tree* (the built yaml-cpp), not the whole
+      # vcpkg checkout. The key includes the package version, so bumping the
+      # version in the install step below naturally invalidates the cache and
+      # forces a rebuild with the new version.
+      - name: Restore yaml-cpp from cache
+        id: cache-yaml
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}/installed/x64-mingw-dynamic
+          key: vcpkg-yaml-cpp-x64-mingw-dynamic-0.9.0-${{ runner.os }}
+          restore-keys: |
+            vcpkg-yaml-cpp-x64-mingw-dynamic-
+
+      - name: Install yaml-cpp
+        if: steps.cache-yaml.outputs.cache-hit != 'true'
+        run: |
+          # Detect the preinstalled vcpkg: the runner image does NOT export
+          # VCPKG_ROOT, so relying on $env:VCPKG_ROOT yields an empty path.
+          # Build the candidate list explicitly - piping an empty string into
+          # Where-Object can collapse to a bogus single-character result.
+          $candidates = @()
+          if ($env:VCPKG_ROOT) { $candidates += $env:VCPKG_ROOT }
+          $candidates += "C:\vcpkg"
+          $candidates += "${{ env.RUNNER_TOOL_CACHE }}\vcpkg"
+
+          $vcpkgRoot = $candidates |
+            Where-Object { $_ -and (Test-Path (Join-Path $_ 'scripts\buildsystems\vcpkg.cmake')) } |
+            Select-Object -First 1
+
+          if (-not $vcpkgRoot) {
+            choco install vcpkg -y
+            $vcpkgRoot = @($env:VCPKG_ROOT, "C:\vcpkg") |
+              Where-Object { $_ -and (Test-Path (Join-Path $_ 'scripts\buildsystems\vcpkg.cmake')) } |
+              Select-Object -First 1
+          }
+          if (-not $vcpkgRoot) { throw "vcpkg not found on this runner" }
+
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_TOOLCHAIN_FILE=$vcpkgRoot/scripts/buildsystems/vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & (Join-Path $vcpkgRoot 'vcpkg.exe') install yaml-cpp:x64-mingw-dynamic
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Ensure vcpkg env
+        shell: pwsh
+        run: |
+          # Runs even on a cache hit, where the install step was skipped.
+          $candidates = @()
+          if ($env:VCPKG_ROOT) { $candidates += $env:VCPKG_ROOT }
+          $candidates += "C:\vcpkg"
+          $candidates += "${{ env.RUNNER_TOOL_CACHE }}\vcpkg"
+          $root = $candidates |
+            Where-Object { Test-Path (Join-Path $_ 'scripts\buildsystems\vcpkg.cmake') } |
+            Select-Object -First 1
+          if (-not $root) { throw "vcpkg not found on runner" }
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "VCPKG_ROOT=$root"
+
+      # Qt is by far the slowest download. The key pins the exact Qt version,
+      # so changing 'version:' below is what invalidates this cache.
+      - name: Cache Qt
+        id: cache-qt
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUNNER_TEMP }}/Qt
+          key: qt-${{ runner.os }}-6.5.3-win64_mingw-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            qt-${{ runner.os }}-6.5.3-win64_mingw-
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -90,12 +160,21 @@ jobs:
           host: 'windows'
           target: 'desktop'
           arch: 'win64_mingw'
+          dir: ${{ env.RUNNER_TEMP }}/Qt
+          cache: false
 
       - name: Configure CMake for MinGW
         run: |
-          cmake -B build/mingw -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-mingw-dynamic
+          # Array instead of backtick continuations - a stray character after
+          # the backtick breaks the command in a way that is hard to spot.
+          $cmakeArgs = @(
+            "-B", "build/mingw",
+            "-G", "MinGW Makefiles",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake",
+            "-DVCPKG_TARGET_TRIPLET=x64-mingw-dynamic"
+          )
+          cmake @cmakeArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build with MinGW
@@ -138,15 +217,27 @@ jobs:
             build-essential \
             cmake \
             ninja-build \
+            ccache \
             qt6-base-dev \
             qt6-tools-dev \
             qt6-tools-dev-tools \
             libqt6widgets6 \
             libyaml-cpp-dev
 
+      # ccache keyed on the compiler launcher, not on the sources: the
+      # dependency set only changes when the install list above changes.
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-qt6-yamlcpp
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Configure CMake
         run: |
-          cmake -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+          cmake -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: |
@@ -185,15 +276,25 @@ jobs:
             build-essential \
             cmake \
             ninja-build \
+            ccache \
             qt6-base-dev \
             qt6-tools-dev \
             qt6-tools-dev-tools \
             libqt6widgets6 \
             libyaml-cpp-dev
 
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-qt6-yamlcpp
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Configure CMake
         run: |
-          cmake -B build/linux-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+          cmake -B build/linux-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: |
@@ -227,17 +328,48 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake ninja qt@6 yaml-cpp
+          brew install cmake ninja ccache yaml-cpp
+          # 'qt@6' is only an alias these days; the formula that actually
+          # carries Qt6 is 'qt', so resolve whatever brew installed rather
+          # than hardcoding a prefix that may not exist.
+          brew install qt
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ runner.os }}-qt6-yamlcpp
+          restore-keys: |
+            brew-${{ runner.os }}-
 
       - name: Configure CMake
         run: |
-          export Qt6_DIR="$(brew --prefix qt@6)/lib/cmake/Qt6"
-          export yaml-cpp_DIR="$(brew --prefix yaml-cpp)/lib/cmake/yaml-cpp"
-          echo "Qt6_DIR=$Qt6_DIR"
-          echo "yaml-cpp_DIR=$yaml-cpp_DIR"
-          cmake -B build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DQt6_DIR="$Qt6_DIR" -Dyaml-cpp_DIR="$yaml-cpp_DIR" `
+          # Ask brew for a formula's lib/cmake directory, whatever it is named.
+          qt_cmake="$(brew --prefix qt)/lib/cmake/Qt6"
+          if [ ! -d "$qt_cmake" ]; then
+            qt_cmake="$(brew --prefix qt@6)/lib/cmake/Qt6"
+          fi
+          if [ ! -d "$qt_cmake" ]; then
+            echo "Qt6 cmake config not found" >&2
+            exit 1
+          fi
+          export YAML_CPP_DIR="$(brew --prefix yaml-cpp)/lib/cmake/yaml-cpp"
+          echo "Qt6_DIR=$qt_cmake"
+          echo "yaml-cpp_DIR=$YAML_CPP_DIR"
+          # Use an array instead of backslash/backtick line continuations:
+          # a trailing space after a continuation character silently breaks
+          # the quoting and bash fails with "unexpected EOF".
+          cmake_args=(
+            -B build/macos
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DQt6_DIR="$qt_cmake"
+            -Dyaml-cpp_DIR="$YAML_CPP_DIR"
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
             -DCMAKE_INSTALL_PREFIX=/usr/local
+          )
+          cmake "${cmake_args[@]}"
 
       - name: Build
         run: |

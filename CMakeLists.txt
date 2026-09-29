@@ -10,8 +10,25 @@ if(NOT DEFINED PROJECT_NAME)
     set(PROJECT_NAME "QtAppLauncher" CACHE STRING "Project name")
 endif()
 
+# 单一版本来源：读取仓库根目录的 VERSION 文件。
+# 之前版本号散落在本文件与 include/config.h 中，容易漏改。
 if(NOT DEFINED PROJECT_VERSION)
-    set(PROJECT_VERSION "2.0.0" CACHE STRING "Project version")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" QS_VERSION_RAW)
+        string(STRIP "${QS_VERSION_RAW}" QS_VERSION_STRIPPED)
+    else()
+        set(QS_VERSION_STRIPPED "0.0.0")
+        message(WARNING "VERSION file not found; falling back to 0.0.0")
+    endif()
+
+    # 补齐三段式，CMake 要求 MAJOR.MINOR.PATCH
+    if(QS_VERSION_STRIPPED MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+        set(PROJECT_VERSION "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
+    elseif(QS_VERSION_STRIPPED MATCHES "^([0-9]+)\\.([0-9]+)$")
+        set(PROJECT_VERSION "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.0")
+    else()
+        set(PROJECT_VERSION "${QS_VERSION_STRIPPED}")
+    endif()
 endif()
 
 # 项目基本信息
@@ -47,6 +64,14 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets)
 
 # 查找 yaml-cpp
 find_package(yaml-cpp CONFIG REQUIRED)
+
+# 由 VERSION 文件生成 include/config.h，使版本号只有一处来源。
+# 生成到 ${CMAKE_CURRENT_BINARY_DIR}，其已在 target_include_directories 中。
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/config.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/config.h"
+    @ONLY
+)
 
 # 设置 UI 文件搜索路径
 set(CMAKE_AUTOUIC_SEARCH_PATHS "${CMAKE_CURRENT_SOURCE_DIR}/ui")
@@ -138,8 +163,8 @@ add_library(${PROJECT_NAME}_objs OBJECT
 )
 
 # 包含目录
-target_include_directories(${PROJECT_NAME}_objs 
-    PRIVATE 
+target_include_directories(${PROJECT_NAME}_objs
+    PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_BINARY_DIR}
