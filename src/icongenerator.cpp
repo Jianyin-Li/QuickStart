@@ -33,19 +33,42 @@ QIcon IconGenerator::generateIcon(const QString &text, const QColor &backgroundC
     return QIcon(pixmap);
 }
 
+QIcon IconGenerator::generateBackArrow(const QColor &color, int size)
+{
+    QPixmap pixmap(size, size);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(color, qMax(1.6, size * 0.11), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    // Chevron pointing left, inset so the stroke is never clipped.
+    QPen pen = painter.pen();
+    qreal inset = pen.widthF() / 2.0 + 1.0;
+    qreal midY = size / 2.0;
+    qreal leftX = inset;
+    qreal rightX = size - inset;
+    painter.drawLine(QPointF(rightX, inset), QPointF(leftX, midY));
+    painter.drawLine(QPointF(leftX, midY), QPointF(rightX, size - inset));
+    painter.end();
+
+    return QIcon(pixmap);
+}
+
 const QList<QColor>& IconGenerator::getDefaultColors()
 {
+    // Muted, mid-tone colours. A grid of fully saturated primaries reads as
+    // noise; these stay distinguishable but sit quietly next to each other.
     static const QList<QColor> colors = {
-        QColor(66, 133, 244),   // Blue
-        QColor(219, 68, 55),    // Red
-        QColor(244, 180, 0),    // Yellow
-        QColor(15, 157, 88),    // Green
-        QColor(171, 71, 188),   // Purple
-        QColor(0, 172, 193),    // Cyan
-        QColor(255, 112, 67),   // Orange
-        QColor(121, 85, 72),    // Brown
-        QColor(158, 158, 158),  // Gray
-        QColor(96, 125, 139)    // Blue Gray
+        QColor(90, 132, 178),   // Soft blue
+        QColor(186, 96, 88),    // Soft red
+        QColor(198, 152, 66),   // Soft amber
+        QColor(76, 143, 108),   // Soft green
+        QColor(142, 108, 162),  // Soft violet
+        QColor(84, 148, 160),   // Soft teal
+        QColor(190, 120, 84),   // Soft orange
+        QColor(140, 116, 100),  // Soft taupe
+        QColor(138, 143, 148),  // Soft grey
+        QColor(112, 130, 140)   // Soft slate
     };
     return colors;
 }
