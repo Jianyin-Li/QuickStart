@@ -20,6 +20,7 @@
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QToolButton>
+#include <memory>
 #include <yaml-cpp/yaml.h>
 
 namespace {
@@ -149,7 +150,8 @@ MainWindow::MainWindow(AppItem *initialItem, MainWindow *parentWindow)
         actionToggleDarkMode->setChecked(true);
     }
 
-    QString name = this->currentItem->getName().isEmpty() ? tr("Home") : this->currentItem->getName();
+    QString name = this->currentItem ? this->currentItem->getName() : QString();
+    if (name.isEmpty()) name = tr("Home");
     setWindowTitle(tr("App Launcher - %1").arg(name));
     ui->statusbar->showMessage(tr("Current: %1").arg(name));
 
@@ -449,19 +451,25 @@ void MainWindow::setupContextMenu()
     ui->iconListWidget->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(ui->iconListWidget, &QWidget::customContextMenuRequested,
             this, &MainWindow::showContextMenu);
+
+    // QListWidgetItem is not a QObject, so there is no QPointer to invalidate
+    // contextMenuItem automatically. Drop the reference as soon as the items
+    // go away, otherwise the context-menu actions would use a dangling item.
+    connect(ui->iconListWidget, &QObject::destroyed, this, [this]() {
+        contextMenuItem = nullptr;
+    });
 }
 
 void MainWindow::showContextMenu(const QPoint &pos)
 {
     contextMenuItem = ui->iconListWidget->itemAt(pos);
 
-    if (contextMenuItem) {
-        int tag = contextMenuItem->data(Qt::UserRole + 1).toInt();
-        if (tag == TagNull) {
-            return;
-        }
-        contextMenu->exec(ui->iconListWidget->mapToGlobal(pos));
+    if (!contextMenuItem) return;
+    if (contextMenuItem->data(Qt::UserRole + 1).toInt() == TagNull) {
+        contextMenuItem = nullptr;
+        return;
     }
+    contextMenu->exec(ui->iconListWidget->mapToGlobal(pos));
 }
 
 void MainWindow::onEditItem()
@@ -471,38 +479,40 @@ void MainWindow::onEditItem()
     int tag = contextMenuItem->data(Qt::UserRole + 1).toInt();
     if (tag == TagAppItem) {
         auto *appItem = static_cast<AppItem*>(contextMenuItem->data(Qt::UserRole).value<QObject*>());
-        if (currentItem->getSubApps().contains(appItem)) {
+        if (appItem && currentItem->getSubApps().contains(appItem)) {
             AppConfigDialog dialog(appItem, this);
             if (dialog.exec() == QDialog::Accepted) {
-                AppItem *newApp = dialog.getNewApp();
-                if (newApp) {
-                    int index = currentItem->getSubApps().indexOf(appItem);
-                    if (index != -1) {
-                        currentItem->removeSubApp(appItem);
-                        currentItem->addSubApp(newApp);
-                        contextMenuItem = nullptr;
-                        refreshIconList();
-                        saveConfig();
-                    }
+                // The dialog hands over an unparented item; own it here until
+                // the tree takes it, so a failed handover cannot leak it.
+                std::unique_ptr<AppItem> newApp(dialog.getNewApp());
+                // Re-validate: the modal dialog ran a nested event loop in
+                // which currentItem may have been detached or destroyed.
+                if (newApp && currentItem && currentItem->getSubApps().contains(appItem)) {
+                    contextMenuItem = nullptr;
+                    currentItem->removeSubApp(appItem);
+                    currentItem->addSubApp(newApp.release());
+                    refreshIconList();
+                    saveConfig();
                 }
             }
         }
     }
     else if (tag == TagFuncItem) {
         auto *funcItem = static_cast<FuncItem*>(contextMenuItem->data(Qt::UserRole).value<QObject*>());
-        if (currentItem->getFuncs().contains(funcItem)) {
+        if (funcItem && currentItem->getFuncs().contains(funcItem)) {
             FuncConfigDialog dialog(funcItem, this);
             if (dialog.exec() == QDialog::Accepted) {
-                FuncItem *newFunc = dialog.getNewFunc();
-                if (newFunc) {
-                    int index = currentItem->getFuncs().indexOf(funcItem);
-                    if (index != -1) {
-                        currentItem->removeFunc(funcItem);
-                        currentItem->addFunc(newFunc);
-                        contextMenuItem = nullptr;
-                        refreshIconList();
-                        saveConfig();
-                    }
+                // The dialog hands over an unparented item; own it here until
+                // the tree takes it, so a failed handover cannot leak it.
+                std::unique_ptr<FuncItem> newFunc(dialog.getNewFunc());
+                // Re-validate: the modal dialog ran a nested event loop in
+                // which currentItem may have been detached or destroyed.
+                if (newFunc && currentItem && currentItem->getFuncs().contains(funcItem)) {
+                    contextMenuItem = nullptr;
+                    currentItem->removeFunc(funcItem);
+                    currentItem->addFunc(newFunc.release());
+                    refreshIconList();
+                    saveConfig();
                 }
             }
         }
@@ -523,12 +533,14 @@ void MainWindow::onDeleteItem()
                                  tr("Are you sure you want to delete \"%1\"?").arg(itemName),
                                  QMessageBox::Yes | QMessageBox::No);
 
-    if (reply == QMessageBox::Yes) {
+    // The modal dialog runs a nested event loop; the list (and therefore
+    // contextMenuItem) may have been cleared in the meantime.
+    if (reply == QMessageBox::Yes && contextMenuItem && currentItem) {
         if (tag == TagAppItem) {
             auto *appItem = static_cast<AppItem*>(contextMenuItem->data(Qt::UserRole).value<QObject*>());
-            if (currentItem->getSubApps().contains(appItem)) {
-                currentItem->removeSubApp(appItem);
+            if (appItem && currentItem->getSubApps().contains(appItem)) {
                 contextMenuItem = nullptr;
+                currentItem->removeSubApp(appItem);
                 refreshIconList();
                 saveConfig();
                 return;
@@ -536,9 +548,9 @@ void MainWindow::onDeleteItem()
         }
         else if (tag == TagFuncItem) {
             auto *funcItem = static_cast<FuncItem*>(contextMenuItem->data(Qt::UserRole).value<QObject*>());
-            if (currentItem->getFuncs().contains(funcItem)) {
-                currentItem->removeFunc(funcItem);
+            if (funcItem && currentItem->getFuncs().contains(funcItem)) {
                 contextMenuItem = nullptr;
+                currentItem->removeFunc(funcItem);
                 refreshIconList();
                 saveConfig();
                 return;
@@ -620,6 +632,8 @@ void MainWindow::refreshIconList()
 {
     if (!currentItem || !ui) return;
 
+    // clear() deletes every item, which would leave contextMenuItem dangling.
+    contextMenuItem = nullptr;
     ui->iconListWidget->clear();
 
     for (AppItem *app : currentItem->getSubApps()) {
@@ -654,7 +668,7 @@ void MainWindow::refreshIconList()
 
 void MainWindow::onIconListItemClicked(QListWidgetItem *item)
 {
-    if (!item) return;
+    if (!item || !currentItem) return;
 
     int tag = item->data(Qt::UserRole + 1).toInt();
 
@@ -679,7 +693,7 @@ void MainWindow::onIconListItemClicked(QListWidgetItem *item)
     }
     else if (tag == TagAppItem) {
         auto *appItem = static_cast<AppItem*>(item->data(Qt::UserRole).value<QObject*>());
-        if (currentItem->getSubApps().contains(appItem)) {
+        if (appItem && currentItem->getSubApps().contains(appItem)) {
             // Navigation parent is tracked explicitly instead of via the
             // QWidget parent: child windows use WA_DeleteOnClose, so a QWidget
             // parent would delete them a second time when it is destroyed.
@@ -692,6 +706,7 @@ void MainWindow::onIconListItemClicked(QListWidgetItem *item)
     }
     else if (tag == TagFuncItem) {
         auto *funcItem = static_cast<FuncItem*>(item->data(Qt::UserRole).value<QObject*>());
+        if (!currentItem->getFuncs().contains(funcItem)) return;
         for (const QString &cmd : funcItem->getCmds()) {
             QStringList parts = QProcess::splitCommand(cmd);
             if (!parts.isEmpty()) {
@@ -708,11 +723,15 @@ void MainWindow::onIconListItemClicked(QListWidgetItem *item)
 
 void MainWindow::onAddAppClicked()
 {
+    if (!currentItem) return;
+
     AppConfigDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
-        AppItem *newApp = dialog.getNewApp();
-        if (newApp) {
-            currentItem->addSubApp(newApp);
+        // The dialog hands over an unparented item; own it here until the tree
+        // takes it, so a failed handover cannot leak it.
+        std::unique_ptr<AppItem> newApp(dialog.getNewApp());
+        if (newApp && currentItem) {
+            currentItem->addSubApp(newApp.release());
             refreshIconList();
             saveConfig();
         }
@@ -721,11 +740,15 @@ void MainWindow::onAddAppClicked()
 
 void MainWindow::onAddFuncClicked()
 {
+    if (!currentItem) return;
+
     FuncConfigDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
-        FuncItem *newFunc = dialog.getNewFunc();
-        if (newFunc) {
-            currentItem->addFunc(newFunc);
+        // The dialog hands over an unparented item; own it here until the tree
+        // takes it, so a failed handover cannot leak it.
+        std::unique_ptr<FuncItem> newFunc(dialog.getNewFunc());
+        if (newFunc && currentItem) {
+            currentItem->addFunc(newFunc.release());
             refreshIconList();
             saveConfig();
         }

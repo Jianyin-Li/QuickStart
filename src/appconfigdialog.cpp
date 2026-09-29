@@ -80,7 +80,11 @@ void AppConfigDialog::onConfirmClicked()
         return;
     }
 
-    newApp = new AppItem(appName, iconPath, this);
+    // No QObject parent: the returned item is handed over to the caller's
+    // AppItem tree, which takes ownership via addSubApp(). Parenting it here
+    // would delete it together with this (stack-allocated) dialog, leaving a
+    // dangling pointer inside the tree.
+    newApp = new AppItem(appName, iconPath);
     accept();
 }
 

@@ -72,6 +72,9 @@ private:
     QMenu *contextMenu;
     QAction *editAction;
     QAction *deleteAction;
+    // Raw on purpose: it is never dereferenced after being cleared, and
+    // ui->iconListWidget's destroyed() handler resets it (QPointer cannot be
+    // used because QListWidgetItem is not a QObject).
     QListWidgetItem *contextMenuItem;
 
     QAction *actionOpen_config;

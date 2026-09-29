@@ -156,7 +156,11 @@ void FuncConfigDialog::onConfirmClicked()
         cmds.append(ui->cmdListWidget->item(i)->text());
     }
 
-    newFunc = new FuncItem(funcName, iconPath, cmds, this);
+    // No QObject parent: the returned item is handed over to the caller's
+    // AppItem tree, which takes ownership via addFunc(). Parenting it here
+    // would delete it together with this (stack-allocated) dialog, leaving a
+    // dangling pointer inside the tree.
+    newFunc = new FuncItem(funcName, iconPath, cmds);
     accept();
 }
 
